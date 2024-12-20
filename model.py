@@ -20,6 +20,7 @@ import wandb
 import hydra
 from hydra import compose, initialize
 import omegaconf
+from torch.utils.data import DataLoader
 
 from src.models.lpn import LPN
 from src.models.utils import DecoderTransformerConfig, EncoderTransformerConfig
@@ -44,9 +45,9 @@ from src.datasets.task_gen.dataloader import make_task_gen_dataloader, make_data
 logging.getLogger().setLevel(logging.INFO)
 
 # TODO:
-# 1) What are States?
-# 2) Where do I specify the dataset in the training loop? what is the expected format?
-# 3) Did I use the right YAML file from the repo?
+# 1) Where do I specify the dataset in the training loop? what is the expected format?
+# 2) Did I use the right YAML file from the repo?
+# 3) How do I implement the test function?
 
 def instantiate_config_for_mpt(
     transformer_cfg: omegaconf.DictConfig,
@@ -77,11 +78,19 @@ class LPNModelWrapper:
         self.model = LPN(encoder=encoder, decoder=decoder)
         self.trainer = Trainer(self.cfg, self.model)
 
-    def train_dataset(self, train_dataloader):
+    def train_dataset(self, train_dataloader, val_dataloader):
         init_key, train_key = jax.random.split(jax.random.PRNGKey(self.cfg.training.seed))
         init_state = self.trainer.init_train_state(init_key, self.cfg.training.learning_rate)
 
-        self.trainer.train(init_state, self.cfg, train_key)
+        if self.cfg.training.get("resume_from_checkpoint", False):
+            checkpoint_path = self.cfg.training.resume_from_checkpoint
+            logging.info(f"Resuming from checkpoint: {checkpoint_path}...")
+            init_state = self.trainer.load_checkpoint(checkpoint_path, init_state)
+
+        final_state = self.trainer.train(init_state, self.cfg, train_dataloader, val_dataloader, train_key)
+
+        # Save the final checkpoint, after getting the state from the first device
+        self.trainer.save_checkpoint("state.msgpack", tree_map(lambda x: x[0], final_state))
 
     def test_dataset(self, test_dataloader):
         # TODO
@@ -408,36 +417,36 @@ class Trainer:
         metrics = tree_map(jnp.mean, metrics)
         return state, metrics
 
-    @partial(jax.jit, static_argnames=("self", "log_every_n_steps"), backend="cpu")
-    def prepare_train_dataset_for_epoch(
-        self, key: chex.PRNGKey, log_every_n_steps: int
-    ) -> tuple[chex.Array, chex.Array]:
-        """Shuffle the dataset and reshape it to
-        (num_logs, log_every_n_steps, num_devices, batch_size_per_device, *).
-        """
-        shuffle_key, augmentation_key = jax.random.split(key)
-        grids, shapes = shuffle_dataset_into_batches(
-            self.train_dataset_grids, self.train_dataset_shapes, self.batch_size, shuffle_key
-        )  # (L, B, *)
-        num_logs = grids.shape[0] // log_every_n_steps
-        grids = grids[: num_logs * log_every_n_steps]
-        shapes = shapes[: num_logs * log_every_n_steps]
+    # @partial(jax.jit, static_argnames=("self", "log_every_n_steps"), backend="cpu")
+    # def prepare_train_dataset_for_epoch(
+    #     self, key: chex.PRNGKey, log_every_n_steps: int
+    # ) -> tuple[chex.Array, chex.Array]:
+    #     """Shuffle the dataset and reshape it to
+    #     (num_logs, log_every_n_steps, num_devices, batch_size_per_device, *).
+    #     """
+    #     shuffle_key, augmentation_key = jax.random.split(key)
+    #     grids, shapes = shuffle_dataset_into_batches(
+    #         self.train_dataset_grids, self.train_dataset_shapes, self.batch_size, shuffle_key
+    #     )  # (L, B, *)
+    #     num_logs = grids.shape[0] // log_every_n_steps
+    #     grids = grids[: num_logs * log_every_n_steps]
+    #     shapes = shapes[: num_logs * log_every_n_steps]
 
-        if grids.shape[1] % self.num_devices != 0:
-            raise ValueError(
-                f"Train batch size {grids.shape[1]} is not divisible by the number of devices {self.num_devices}."
-            )
-        batch_size_per_device = grids.shape[1] // self.num_devices
+    #     if grids.shape[1] % self.num_devices != 0:
+    #         raise ValueError(
+    #             f"Train batch size {grids.shape[1]} is not divisible by the number of devices {self.num_devices}."
+    #         )
+    #     batch_size_per_device = grids.shape[1] // self.num_devices
 
-        if self.online_data_augmentation:
-            grids, shapes = data_augmentation_fn(grids, shapes, augmentation_key)
-        grids = grids.reshape(
-            num_logs, self.num_devices, log_every_n_steps, batch_size_per_device, *grids.shape[2:]
-        )
-        shapes = shapes.reshape(
-            num_logs, self.num_devices, log_every_n_steps, batch_size_per_device, *shapes.shape[2:]
-        )
-        return grids, shapes
+    #     if self.online_data_augmentation:
+    #         grids, shapes = data_augmentation_fn(grids, shapes, augmentation_key)
+    #     grids = grids.reshape(
+    #         num_logs, self.num_devices, log_every_n_steps, batch_size_per_device, *grids.shape[2:]
+    #     )
+    #     shapes = shapes.reshape(
+    #         num_logs, self.num_devices, log_every_n_steps, batch_size_per_device, *shapes.shape[2:]
+    #     )
+    #     return grids, shapes
 
     def eval(
         self,
@@ -577,7 +586,7 @@ class Trainer:
 
         # Extract the average accuracy for each pixel across batch and num_problems dimensions
         pixel_correct_binary = (generated_grids == dataset_grids[..., 1]) * grid_pad_mask
-        pixel_accuracy = pixel_correct_binary.sum(axis=(0, 1)) / (grid_pad_mask.sum(axis=(0, 1)) + 1e-5)
+        pixel_accuracy = pixel_correct_binary.sum(axis=(0, 1)) / (grid_pad_mask.sum(axis=(0, 1)) + 1e-5
 
         # Create heatmap of pixel accuracy and pixel frequency
         fig_heatmap = visualize_heatmap(
@@ -599,38 +608,6 @@ class Trainer:
 
         return metrics, fig_grids, fig_heatmap, fig_latents
 
-    @classmethod
-    def test_json_submission(
-        cls,
-        state: TrainState,
-        evaluator: Evaluator,
-        json_challenges_file: str,
-        json_solutions_file: str,
-        test_name: str,
-        key: chex.PRNGKey,
-        only_n_tasks: Optional[int] = None,
-        overfit_task: Optional[str] = None,
-        num_tasks_to_show: int = 5,
-        progress_bar: bool = False,
-    ) -> tuple[dict[str, float], Optional[plt.Figure]]:
-        with open(json_challenges_file, "r") as f:
-            challenges = json.load(f)
-        train = "training" in json_challenges_file
-        generations = evaluator.json_submission(
-            challenges, state.params, only_n_tasks, overfit_task, progress_bar, key, train=train
-        )
-        with open(json_solutions_file, "r") as f:
-            solutions = json.load(f)
-        metrics = evaluator.evaluate_generations(generations, solutions)
-        metrics = {f"test/{test_name}/{k}": v for k, v in metrics.items()}
-
-        if num_tasks_to_show:
-            fig_grids = visualize_json_submission(challenges, generations, solutions, num_tasks_to_show)
-        else:
-            fig_grids = None
-
-        return metrics, fig_grids
-
     def train_epoch(
         self,
         state: TrainState,
@@ -638,32 +615,15 @@ class Trainer:
         trange: tqdm.tqdm,
         total_num_steps: int,
         log_every_n_steps: int,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader,
         eval_every_n_logs: Optional[int] = None,
         save_checkpoint_every_n_logs: Optional[int] = None,
     ) -> TrainState:
-        key, dataset_key = jax.random.split(key)
-        if self.task_generator:
-            task_generator_kwargs = dict(self.task_generator_kwargs)
-            num_workers = task_generator_kwargs.pop("num_workers")
-            task_generator_class = task_generator_kwargs.pop("class")
-            num_pairs = task_generator_kwargs.pop("num_pairs")
-            dataloader = make_task_gen_dataloader(
-                batch_size=self.batch_size,
-                log_every_n_steps=log_every_n_steps,
-                num_workers=num_workers,
-                task_generator_class=task_generator_class,
-                num_pairs=num_pairs,
-                num_devices=self.num_devices,
-                online_data_augmentation=self.online_data_augmentation,
-                **task_generator_kwargs,
-            )
-        else:
-            # dataset shapes (num_logs, num_devices, log_every_n_steps, batch_size_per_device, *)
-            grids, shapes = self.prepare_train_dataset_for_epoch(dataset_key, log_every_n_steps)
-            dataloader = zip(grids, shapes)
         dataloading_time = time.time()
-        for batches in dataloader:
+        for batches in train_dataloader:
             wandb.log({"timing/dataloading_time": time.time() - dataloading_time})
+            
             # Training
             key, train_key = jax.random.split(key)
             start = time.time()
@@ -687,11 +647,18 @@ class Trainer:
             if eval_every_n_logs and self.num_logs % eval_every_n_logs == 0:
                 key, eval_key, test_key, json_key = jax.random.split(key, 4)
 
-                # Eval datasets
-                for dataset_dict in self.eval_datasets:
+                # Validation
+                for val_batches in val_dataloader:
                     start = time.time()
-                    eval_metrics = self.eval(state, key=eval_key, **dataset_dict)
-                    eval_metrics[f"timing/eval_{dataset_dict['dataset_name']}"] = time.time() - start
+                    eval_metrics = self.eval(
+                        state,
+                        dataset_name="validation",
+                        dataset_grids=val_batches[0],
+                        dataset_shapes=val_batches[1],
+                        key=eval_key,
+                        batch_size=self.batch_size
+                    )
+                    eval_metrics["timing/eval_validation"] = time.time() - start
                     wandb.log(eval_metrics, step=self.num_steps)
 
                 # Dataset test
@@ -733,6 +700,8 @@ class Trainer:
         self,
         state: TrainState,
         cfg: omegaconf.DictConfig,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader,
         key: chex.PRNGKey,
         progress_bar: bool = True,
         start_num_steps: int = 0,
@@ -752,23 +721,21 @@ class Trainer:
         logging.info(f"Number of decoder parameters: {num_params_decoder:,}")
         logging.info(f"Running on devices: {self.devices}.")
         logging.info(f"Total number of gradient steps: {total_num_steps:,}.")
-        if not self.task_generator:
-            num_logs_per_epoch = self.train_dataset_grids.shape[0] // (log_every_n_steps * self.batch_size)
-            if num_logs_per_epoch == 0:
-                raise ValueError(
-                    "The number of logs per epoch is 0 because the dataset size is "
-                    f"{self.train_dataset_grids.shape[0]} < {self.batch_size=} * {log_every_n_steps=}."
-                )
-            num_steps_per_epoch = num_logs_per_epoch * log_every_n_steps
-            num_epochs = math.ceil(total_num_steps / num_steps_per_epoch)
 
-            logging.info(f"Number of epochs: {num_epochs:,}.")
-            logging.info(f"Number of logs per epoch: {num_logs_per_epoch:,}.")
-            logging.info(f"Number of gradient steps per epoch: {num_steps_per_epoch:,}.")
-            logging.info(f"Total number of logs: {num_logs_per_epoch * num_epochs:,}.")
-        else:
-            num_epochs = 1
-            logging.info(f"Total number of logs: {total_num_steps // log_every_n_steps:,}.")
+        num_batches_per_epoch = len(train_dataloader)
+        num_logs_per_epoch = num_batches_per_epoch // log_every_n_steps
+        if num_logs_per_epoch == 0:
+            raise ValueError(
+                "The number of logs per epoch is 0 because the dataset size is too small "
+                f"compared to {log_every_n_steps=}."
+            )
+        num_steps_per_epoch = num_logs_per_epoch * log_every_n_steps
+        num_epochs = math.ceil(total_num_steps / num_steps_per_epoch)
+
+        logging.info(f"Number of epochs: {num_epochs:,}.")
+        logging.info(f"Number of logs per epoch: {num_logs_per_epoch:,}.")
+        logging.info(f"Number of gradient steps per epoch: {num_steps_per_epoch:,}.")
+        logging.info(f"Total number of logs: {num_logs_per_epoch * num_epochs:,}.")
         logging.info(f"Logging every {log_every_n_steps:,} gradient steps.")
         if eval_every_n_logs:
             steps_between_evals = eval_every_n_logs * log_every_n_steps
@@ -795,6 +762,8 @@ class Trainer:
                     log_every_n_steps,
                     eval_every_n_logs,
                     save_checkpoint_every_n_logs,
+                    train_dataloader=train_dataloader,
+                    val_dataloader=val_dataloader
                 )
         except KeyboardInterrupt:
             logging.info("Interrupted training.")
